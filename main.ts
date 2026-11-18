@@ -23,8 +23,8 @@
 //   TARGET — close >= entry price * (1 + 80 bps): bank the leg.
 //   TRAIL  — close <= peak close * (1 - 80 bps): give a winner room
 //            to breathe, cut it once it turns decisively.
-// Entry price is derived from the position's cost / quantity
-// (both BigInts from the harness), never from a float.
+// Entry price is the buy fill's own price, read from the batch's
+// fills (both BigInts from the harness), never from a float.
 //
 // Sizing: a buy spends all cash (100% of equity, the cap). One order
 // per reply at most. max_slippage_bps 100: the dev window's largest
@@ -74,13 +74,27 @@ function retBps(w: number): bigint | null {
 }
 
 await runBars({
-  onBatch(state: BarsState, _batch: Batch): OrderInput[] {
+  onBatch(state: BarsState, batch: Batch): OrderInput[] {
     if (state.warmingUp) return [];
     const bar = state.latest.get(SYMBOL);
     if (bar === undefined) return [];
     const close = BigInt(bar.c);
     closes.push(close);
     if (closes.length > HISTORY_MAX) closes.splice(0, closes.length - HISTORY_MAX);
+
+    // The exact fill price of a buy that landed on this batch: the
+    // entry price for the target / trailing stop. (Deriving it from
+    // cost / qty instead overstates it by the 4 bps fee, because the
+    // position's cost is the cash spent, fees included — enough to
+    // miss a target exit by a few bps, as the dev window's first
+    // trade showed.)
+    for (const fill of batch.fills) {
+      if (fill.symbol === SYMBOL && fill.side === 'buy' && fill.status === 'filled') {
+        entryPx = BigInt(fill.price);
+        peakPx = entryPx;
+        holding = true;
+      }
+    }
 
     const pos = state.positions.get(SYMBOL);
     const qty = pos === undefined ? 0n : pos.qty;
@@ -124,7 +138,9 @@ await runBars({
     }
 
     // Holding: initialise entry / peak from the filled position.
-    // entryPx = cost / qty expressed in raw price units:
+    // Normally the buy fill above already set them exactly; this
+    // fallback derives them from cost / qty (cost is the cash spent,
+    // fees included, so it sits ~4 bps above the fill price):
     // value = qty * price * 10^quote_scale / 10^(qty_scale + price_scale),
     // so price = cost * 10^(8 + 5) / (qty * 10^6) = cost * 10^7 / qty.
     if (!holding) {
